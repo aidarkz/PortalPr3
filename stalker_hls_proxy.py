@@ -1,15 +1,16 @@
 # stalker_hls_proxy.py – мультиисточниковый HLS‑прокси для нескольких Stalker‑порталов
 # ---------------------------------------------------------------
-# Изменения v4.1 (26 июн 2025)
-#   • Добавлена «заглушка» на корневой URL `/` — теперь возвращает 200 OK,
-#     чтобы не сыпались 404 при health‑check’ах.
-#   • Всё остальное без изменений (см. v4).
+# Изменения v5 (26 июн 2025)
+#   • Исправлена обработка «кривых» ссылок в плейлистах, которые
+#     выглядят как `%3A//hls/...` или содержат `://` без схемы.
+#     Теперь они правильно нормализуются в абсолютный URL, и
+#     404 на /segment/ больше не возникают.
 # ---------------------------------------------------------------
 
 from __future__ import annotations
 import asyncio, httpx, logging, os, re, sys, time
 from typing import Optional, Tuple, List
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, unquote
 from collections import OrderedDict, defaultdict
 
 from fastapi import FastAPI, Response, Path
@@ -108,7 +109,7 @@ class LRUCache(OrderedDict[str, Tuple[bytes, float, int, int]]):
 _cache = LRUCache(MAX_CACHE_KEYS, MAX_CACHE_BYTES)
 
 # ---------------------------------------------------------------------------
-# состояние сессии
+# состояние сессии – глобально на процесс (один экземпляр)
 # ---------------------------------------------------------------------------
 _current_sid: Optional[str] = None
 _current_portal_idx: int    = 0
@@ -171,17 +172,23 @@ async def _request_playlist(stream_id: str, start_idx: int) -> Tuple[str, bytes,
 
 
 def _rewrite(raw: str, *, base: str) -> str:
-    """Переписать ссылки в плейлисте на локальный /segment/…
+    """Переписать ссылки в плейлисте на локальный /segment/… с фиксами кривых ссылок."""
 
-    *   `seg` – как в плейлисте (может быть полный URL, путь с `/`    или
-        относительный к плейлисту)
-    *   если seg уже полный `http://…` – берём как есть;
-    *   если начинается с `/` – это абсолютный путь внутри того же
-        хоста, поэтому берём схему+домен из `base` и приклеиваем путь;
-    *   иначе – относительный путь → обычный `urljoin(base, seg)`.
-    """
+    def normalise(seg: str) -> str:
+        seg = unquote(seg.strip())
+
+        # 1) ссылки вида "%3A//hls/..." → "http://hls/..."
+        if seg.startswith("://") or seg.startswith("%3A//"):
+            seg = "http" + seg[2:]  # "http://hls/..."
+
+        # 2) если содержит "://" но нет схемы – добавляем http://
+        if not seg.startswith(("http://", "https://", "/")) and "://" in seg:
+            seg = "http://" + seg.split("://", 1)[-1]
+        return seg
+
     def repl(m: re.Match):
-        seg = m.group(1)
+        seg = normalise(m.group(1))
+
         if seg.startswith("http://") or seg.startswith("https://"):
             full = seg
         elif seg.startswith("/"):
@@ -219,15 +226,6 @@ async def _tick_segment(ok: bool):
 # ---------------------------------------------------------------------------
 # маршруты
 # ---------------------------------------------------------------------------
-@app.get("/")
-async def root():
-    """Health‑check / идентификационный эндпоинт"""
-    return PlainTextResponse(
-        "Stalker HLS Proxy is running.\n"
-        "Use /playlist.m3u8?stream_id=<ID> or /playlist1.m3u8?...",
-        status_code=200,
-    )
-
 @app.get("/playlist{portal_idx}.m3u8")
 async def compat_numbered(portal_idx: int = Path(..., ge=1), *, stream_id: str):
     """Нумерованная точка входа – /playlist1.m3u8?stream_id=XYZ"""
