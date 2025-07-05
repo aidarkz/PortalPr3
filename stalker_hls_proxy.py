@@ -49,8 +49,8 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
                     datefmt="%H:%M:%S", level=logging.INFO)
 
 _client = httpx.AsyncClient(timeout=HTTP_TIMEOUT,
-                             headers={"User-Agent": "Mozilla/5.0 (Qt; STB/1.0)"},
-                             follow_redirects=True)
+    headers={"User-Agent": "Mozilla/5.0 (Qt; STB/1.0)"},
+    follow_redirects=True)
 
 # ---------------------------------------------------------------------------
 # LRU cache  url → (body, expire_ts, status, size)
