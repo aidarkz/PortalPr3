@@ -1,269 +1,226 @@
-# stalker_hls_proxy.py – мультиисточниковый HLS‑прокси для нескольких Stalker‑порталов
-# ---------------------------------------------------------------
-# Изменения v5 (26 июн 2025)
-#   • Исправлена обработка «кривых» ссылок в плейлистах, которые
-#     выглядят как `%3A//hls/...` или содержат `://` без схемы.
-#     Теперь они правильно нормализуются в абсолютный URL, и
-#     404 на /segment/ больше не возникают.
-# ---------------------------------------------------------------
+# stalker_hls_proxy.py – мультисессионный HLS‑прокси для одного или нескольких Stalker‑порталов
+# ---------------------------------------------------------------------------
+# Изменения v6 (27 июн 2025)
+#   • _rewrite() добавил нормализацию «кривых» сегментов (%3A//, :// без схемы,
+#     двойные слеши и т.п.) ⇒ 404 больше не встречаются.
+#   • Перешёл от ГЛОБАЛЬНЫХ счётчиков к per‑stream state ⇒ несколько клиентов
+#     могут смотреть разные каналы параллельно без взаимного влияния.
+#   • Чёткое разделение «плохих» HTTP‑кодов (407/458/512/451/405) и сетевых
+#     ошибок – на них просто берётся следующий MAC.
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
-import asyncio, httpx, logging, os, re, sys, time
-from typing import Optional, Tuple, List
-from urllib.parse import quote, urljoin, urlparse, unquote
+import asyncio, httpx, logging, re, sys, time
 from collections import OrderedDict, defaultdict
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
-from fastapi import FastAPI, Response, Path
+from fastapi import FastAPI, Path, Response
 from starlette.responses import PlainTextResponse
 
 # ---------------------------------------------------------------------------
-# конфиг – правим только здесь
+# CONFIG
 # ---------------------------------------------------------------------------
-PORTALS: List[str] = [              # порядок – от «любимого» к запасным
+PORTALS: List[str] = [
     "ledir.thund.re",
     "stalker.ugoiptv.com:80",
 ]
 
 MAC_POOL = [
-    "00:1A:79:00:0A:2C",
-    "00:1A:79:1A:04:B7",
-    "00:1A:79:C5:94:26",
-    "00:1A:79:02:13:52",
-    "00:1A:79:B9:81:75",
-    "00:1A:79:02:59:77",
-    "00:1A:79:73:16:62",
-    "00:1A:79:C6:E5:E9",
-    "00:1A:79:00:09:7E",
-    "00:1A:79:22:5A:77",
-    "00:1A:79:74:4E:C7",
+    "00:1A:79:00:0A:2C", "00:1A:79:1A:04:B7", "00:1A:79:C5:94:26",
+    "00:1A:79:02:13:52", "00:1A:79:B9:81:75", "00:1A:79:02:59:77",
+    "00:1A:79:73:16:62", "00:1A:79:C6:E5:E9", "00:1A:79:00:09:7E",
+    "00:1A:79:22:5A:77", "00:1A:79:74:4E:C7",
 ]
 
-MAX_CACHE_KEYS       = 10_000
-MAX_CACHE_BYTES      = 150 * 2**20   # 150 MiB
-SEGMENTS_PER_SESSION = 6
-MIN_SWITCH_DELAY     = 4   # сек.
-PLAYLIST_TTL         = 20
-SEGMENT_TTL          = 8
-HTTP_TIMEOUT         = 10
+MAX_CACHE_KEYS  = 10_000
+MAX_CACHE_BYTES = 150 * 2**20  # 150 MiB
+PLAYLIST_TTL    = 20           # s
+SEGMENT_TTL     = 8            # s
+SEG_OK_LIMIT    = 6            # ts before optional reswitch
+MIN_SWITCH_SEC  = 4
+HTTP_TIMEOUT    = 10
+BAD_CODES       = {407, 458, 451, 512, 405}
 
 # ---------------------------------------------------------------------------
 app = FastAPI()
 log = logging.getLogger("stalker_hls_proxy")
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
+                    datefmt="%H:%M:%S", level=logging.INFO)
 
-_http_client = httpx.AsyncClient(
-    timeout=HTTP_TIMEOUT,
-    headers={
-        "User-Agent": "Mozilla/5.0 (QtEmbedded; U) AppleWebKit/533.3 (KHTML, like Gecko) STB/1.0",
-    },
-    follow_redirects=True,
-)
+_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT,
+                             headers={"User-Agent": "Mozilla/5.0 (Qt; STB/1.0)"},
+                             follow_redirects=True)
 
 # ---------------------------------------------------------------------------
-# LRU‑кеш url -> (body, expire_ts, status, size)
+# LRU cache  url → (body, expire_ts, status, size)
 # ---------------------------------------------------------------------------
-class LRUCache(OrderedDict[str, Tuple[bytes, float, int, int]]):
-    def __init__(self, max_keys: int, max_bytes: int):
-        super().__init__()
-        self._max_keys  = max_keys
-        self._max_bytes = max_bytes
-        self._bytes_now = 0
-        self._lock = asyncio.Lock()
+class LRU(OrderedDict[str, Tuple[bytes, float, int, int]]):
+    def __init__(self):
+        super().__init__(); self.max_k = MAX_CACHE_KEYS; self.max_b = MAX_CACHE_BYTES
+        self.now_b = 0;     self.lock = asyncio.Lock()
 
-    async def get(self, key: str):
-        now = time.time()
-        async with self._lock:
-            rec = self.pop(key, None)
-            if not rec:
-                return None
-            body, exp, status, sz = rec
-            if exp < now:
-                self._bytes_now -= sz
-                return None
-            self[key] = (body, exp, status, sz)
-            log.debug("CACHE HIT  %s", key)
-            return body, status
+    async def get(self, k: str):
+        async with self.lock:
+            rec = self.pop(k, None)
+            if not rec: return None
+            body, exp, st, sz = rec
+            if exp < time.time():
+                self.now_b -= sz; return None
+            self[k] = (body, exp, st, sz)  # touch
+            return body, st
 
-    async def put(self, key: str, body: bytes, ttl: int, status: int):
-        if ttl <= 0:
-            return
-        now, sz = time.time(), len(body)
-        async with self._lock:
-            old = self.pop(key, None)
-            if old:
-                self._bytes_now -= old[3]
-            self[key] = (body, now + ttl, status, sz)
-            self._bytes_now += sz
-            await self._evict()
-            log.debug("CACHE MISS %s (stored, %dkB)", key, sz//1024)
+    async def put(self, k: str, body: bytes, ttl: int, st: int):
+        if ttl <= 0: return
+        async with self.lock:
+            old = self.pop(k, None)
+            if old: self.now_b -= old[3]
+            sz = len(body)
+            self[k] = (body, time.time()+ttl, st, sz); self.now_b += sz
+            while self.now_b>self.max_b or len(self)>self.max_k:
+                _, (_,_,_,s) = self.popitem(last=False); self.now_b -= s
 
-    async def _evict(self):
-        while self._bytes_now > self._max_bytes or len(self) > self._max_keys:
-            _, (_, _, _, sz) = self.popitem(last=False)
-            self._bytes_now -= sz
-
-_cache = LRUCache(MAX_CACHE_KEYS, MAX_CACHE_BYTES)
+_cache = LRU()
 
 # ---------------------------------------------------------------------------
-# состояние сессии – глобально на процесс (один экземпляр)
+# per‑portal MAC index – чтобы разные порталы не банили пачкой
 # ---------------------------------------------------------------------------
-_current_sid: Optional[str] = None
-_current_portal_idx: int    = 0
-_seg_ok: int                = 0
-_last_switch: float         = 0.0
-_switch_lock                = asyncio.Lock()
+_mac_pos: defaultdict[str,int] = defaultdict(lambda:-1)
 
-# для каждого портала – свой индекс MAC’а, чтобы не банили пачкой
-_mac_idx: defaultdict[str, int] = defaultdict(lambda: -1)
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-def _next_mac(host: str) -> str:
-    _mac_idx[host] = (_mac_idx[host] + 1) % len(MAC_POOL)
-    mac = MAC_POOL[_mac_idx[host]]
+def next_mac(host: str) -> str:
+    _mac_pos[host] = (_mac_pos[host]+1) % len(MAC_POOL)
+    mac = MAC_POOL[_mac_pos[host]]
     log.info("HOST %s → MAC %s", host, mac)
     return mac
 
-async def _fetch(url: str, *, ttl: int):
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+async def fetch(url: str, *, ttl: int):
     cached = await _cache.get(url)
-    if cached:
-        return cached  # type: ignore
+    if cached: return cached  # type: ignore
     try:
-        r = await _http_client.get(url)
+        r = await _client.get(url)
     except Exception:
         return b"", 599
     await _cache.put(url, r.content, ttl, r.status_code)
     return r.content, r.status_code
 
-# ---------------------------------------------------------------------------
-# playlist + переписывание сегментов
-# ---------------------------------------------------------------------------
-SEG_RX = re.compile(r"^(?!#)([^\r\n]+)", re.M)
+SEG_RE = re.compile(r"^(?!#)([^\r\n]+)", re.M)
 
-async def _request_playlist(stream_id: str, start_idx: int) -> Tuple[str, bytes, int]:
-    """Пытаемся открыть плейлист начиная с PORTALS[start_idx]"""
-    portals_ring = PORTALS[start_idx:] + PORTALS[:start_idx]
-    for p_idx, host in enumerate(portals_ring):
+# ---------------------------------------------------------------------------
+# ► Per‑stream session state
+# ---------------------------------------------------------------------------
+class Session:
+    def __init__(self):
+        self.portal_idx = 0
+        self.seg_ok = 0
+        self.last_switch = 0.0
+        self.base_url = ""
+        self.lock = asyncio.Lock()
+
+sessions: Dict[str, Session] = defaultdict(Session)  # sid -> Session()
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+async def obtain_playlist(sid: str, start_idx: int) -> Tuple[str, bytes, int]:
+    portals_chain = PORTALS[start_idx:] + PORTALS[:start_idx]
+    for offs, host in enumerate(portals_chain):
         play_url = f"http://{host}/play/live.php"
         for _ in range(len(MAC_POOL)):
-            mac = _next_mac(host)
-            qs  = f"mac={quote(mac)}&stream={stream_id}&extension=m3u8"
-            url = f"{play_url}?{qs}"
+            mac = next_mac(host)
+            q   = f"mac={quote(mac)}&stream={sid}&extension=m3u8"
+            url = f"{play_url}?{q}"
             log.info("PLAYLIST <= %s", url)
             try:
-                r = await _http_client.get(url)
-            except Exception as exc:
-                log.warning("request error: %s", exc)
-                continue
+                r = await _client.get(url)
+            except Exception as e:
+                log.warning("network err: %s", e); continue
             await _cache.put(str(r.url), r.content, PLAYLIST_TTL, r.status_code)
-            if 200 <= r.status_code < 300:
-                base = str(urlparse(str(r.url))._replace(query="", fragment="")).rsplit('/',1)[0] + '/'
-                real_idx = (start_idx + p_idx) % len(PORTALS)
-                log.info("PLAYLIST OK – host=%s idx=%s", host, real_idx+1)
-                return base, r.content, real_idx
-            log.warning("MAC %s @ %s → HTTP %s", mac, host, r.status_code)
-    raise httpx.HTTPStatusError("No portal yielded 2xx", request=None, response=None)
+            if 200<=r.status_code<300:
+                pr = urlparse(str(r.url))._replace(query="", fragment="")
+                base = urlunparse(pr) if str(r.url).endswith('/') else urlunparse(pr).rsplit('/',1)[0] + '/'
+                idx = (start_idx+offs) % len(PORTALS)
+                log.info("PLAYLIST OK – host=%s idx=%s", host, idx)
+                return base, r.content, idx
+            if r.status_code in BAD_CODES:
+                log.warning("MAC %s → HTTP %s (skip)", mac, r.status_code); continue
+            log.warning("MAC %s → unexpected HTTP %s", mac, r.status_code)
+    raise httpx.HTTPStatusError("No working MAC", request=None, response=None)
+
+# -- link normaliser --------------------------------------------------------
+
+def normalise(seg: str) -> str:
+    seg = unquote(seg.strip())
+    if seg.startswith("%3A//"):          # "%3A//hls/..."
+        seg = "http" + seg[2:]
+    if seg.startswith("://"):
+        seg = "http" + seg               # “://hls/…”
+    if "//" in seg and not seg.startswith(("http://","https://","/")):
+        # "hls.domain.com/p.ts" with schema stripped
+        seg = "http://" + seg.split("//",1)[-1]
+    return seg
 
 
-def _rewrite(raw: str, *, base: str) -> str:
-    """Переписать ссылки в плейлисте на локальный /segment/… с фиксами кривых ссылок."""
-
-    def normalise(seg: str) -> str:
-        seg = unquote(seg.strip())
-
-        # 1) ссылки вида "%3A//hls/..." → "http://hls/..."
-        if seg.startswith("://") or seg.startswith("%3A//"):
-            seg = "http" + seg[2:]  # "http://hls/..."
-
-        # 2) если содержит "://" но нет схемы – добавляем http://
-        if not seg.startswith(("http://", "https://", "/")) and "://" in seg:
-            seg = "http://" + seg.split("://", 1)[-1]
-        return seg
-
+def rewrite_m3u8(text: str, *, base: str) -> str:
     def repl(m: re.Match):
         seg = normalise(m.group(1))
-
-        if seg.startswith("http://") or seg.startswith("https://"):
-            full = seg
-        elif seg.startswith("/"):
-            u = urlparse(base)
-            full = f"{u.scheme}://{u.netloc}{seg}"
-        else:
-            full = urljoin(base, seg)
+        full = seg if seg.startswith(("http://","https://")) else urljoin(base, seg)
         u = urlparse(full)
         return f"/segment/{u.scheme}/{u.netloc}{u.path}"
-
-    return SEG_RX.sub(repl, raw)
-
-async def _tick_segment(ok: bool):
-    global _seg_ok, _last_switch
-    if ok:
-        _seg_ok += 1
-    else:
-        _seg_ok = SEGMENTS_PER_SESSION
-    if _seg_ok < SEGMENTS_PER_SESSION:
-        return
-    if time.time() - _last_switch < MIN_SWITCH_DELAY:
-        return
-    async with _switch_lock:
-        if _seg_ok < SEGMENTS_PER_SESSION:
-            return
-        log.info("=== switching playlist after %s segments ===", _seg_ok)
-        _seg_ok = 0
-        _last_switch = time.time()
-        if _current_sid is not None:
-            try:
-                await _request_playlist(_current_sid, _current_portal_idx)
-            except Exception as exc:
-                log.warning("playlist switch failed: %s", exc)
+    return SEG_RE.sub(repl, text)
 
 # ---------------------------------------------------------------------------
-# маршруты
+# Routes
 # ---------------------------------------------------------------------------
-@app.get("/playlist{portal_idx}.m3u8")
-async def compat_numbered(portal_idx: int = Path(..., ge=1), *, stream_id: str):
-    """Нумерованная точка входа – /playlist1.m3u8?stream_id=XYZ"""
-    idx = (portal_idx - 1) % len(PORTALS)
+@app.get("/playlist{idx}.m3u8")
+async def entry_numbered(idx: int = Path(..., ge=1), *, stream_id: str):
     return PlainTextResponse(status_code=307,
-        headers={"Location": f"/stream/{idx}/{stream_id}/index.m3u8"})
+        headers={"Location": f"/stream/{idx-1}/{stream_id}/index.m3u8"})
 
 @app.get("/playlist.m3u8")
-async def compat_default(stream_id: str):
-    """Старый URL без номера использует портал‑0"""
+async def entry_default(stream_id: str):
     return PlainTextResponse(status_code=307,
         headers={"Location": f"/stream/0/{stream_id}/index.m3u8"})
 
 @app.get("/stream/{portal_idx}/{sid}/index.m3u8")
 async def playlist(portal_idx: int, sid: str):
-    global _current_sid, _seg_ok, _last_switch, _current_portal_idx
-    _current_sid        = sid
-    _current_portal_idx = portal_idx % len(PORTALS)
-    _seg_ok             = 0
-    _last_switch        = time.time()
+    sess = sessions[sid]
+    sess.portal_idx = portal_idx % len(PORTALS)
+    sess.seg_ok = 0; sess.last_switch = time.time()
     try:
-        base, raw, _current_portal_idx = await _request_playlist(sid, _current_portal_idx)
+        base, raw, sess.portal_idx = await obtain_playlist(sid, sess.portal_idx)
     except httpx.HTTPStatusError as exc:
         return PlainTextResponse(f"playlist error: {exc}", status_code=502)
-    text = raw.decode(errors="ignore")
-    return Response(_rewrite(text, base=base), media_type="application/vnd.apple.mpegurl")
+    sess.base_url = base
+    return Response(rewrite_m3u8(raw.decode(errors="ignore"), base=base),
+                    media_type="application/vnd.apple.mpegurl")
 
 @app.get("/segment/{proto}/{path:path}")
 async def segment(proto: str, path: str):
     url = f"{proto}://{path}"
-    body, status = await _fetch(url, ttl=SEGMENT_TTL)
-    await _tick_segment(200 <= status < 300)
-    return Response(body, media_type="video/MP2T", status_code=status)
+    body, st = await fetch(url, ttl=SEGMENT_TTL)
+    # try to map back to sid from path (last numeric part before _.ts)
+    maybe_sid = path.split('/')[-1].split('_')[0]
+    sess = sessions.get(maybe_sid)
+    if sess:
+        ok = 200<=st<300
+        sess.seg_ok = sess.seg_ok+1 if ok else SEG_OK_LIMIT
+        if sess.seg_ok>=SEG_OK_LIMIT and time.time()-sess.last_switch>MIN_SWITCH_SEC:
+            async with sess.lock:
+                if sess.seg_ok>=SEG_OK_LIMIT and time.time()-sess.last_switch>MIN_SWITCH_SEC:
+                    log.info("=== switching playlist (sid=%s) after %s segments ===", maybe_sid, sess.seg_ok)
+                    sess.seg_ok = 0; sess.last_switch = time.time()
+                    try:
+                        await obtain_playlist(maybe_sid, sess.portal_idx)
+                    except Exception as e:
+                        log.warning("reswitch failed: %s", e)
+    return Response(body, media_type="video/MP2T", status_code=st)
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    host = "0.0.0.0"
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    log.info("Proxy ready: %s portals, playlist TTL=%ss, segment TTL=%ss", len(PORTALS), PLAYLIST_TTL, SEGMENT_TTL)
     import uvicorn
+    host="0.0.0.0"; port=int(sys.argv[1]) if len(sys.argv)>1 else 8080
+    log.info("Proxy ready: %s portals, playlist TTL=%ss, segment TTL=%ss", len(PORTALS), PLAYLIST_TTL, SEGMENT_TTL)
     uvicorn.run("stalker_hls_proxy:app", host=host, port=port)
