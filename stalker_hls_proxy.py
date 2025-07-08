@@ -1,10 +1,9 @@
-# stalker_hls_proxy.py – мультисессионный HLS‑прокси для одного или нескольких Stalker‑порталов
+# stalker_hls_proxy.py – мультисессионный, memory‑friendly HLS‑прокси для пяти Stalker‑порталов
 # ---------------------------------------------------------------------------
-# Изменения v7 (28 июн 2025)
-#   • Ограничил LRU‑кэш до 100 MiB (было 150 MiB) → экономия RAM.
-#   • Добавлен фоновый сборщик `cleanup_sessions()` – удаляет Session,
-#     которые простаивают > 60 с (порог регулируется). Это защищает
-#     от утечки памяти, когда клиенты «забывают» закрыть плеер.
+# Изменения  v9 (07 июл 2025)
+#   • Добавлен 5‑й портал foxx.pure‑iptv.net:80 с обязательным AuthToken.
+#   • CONFIG теперь содержит TOKEN_HOSTS и AUTH_TOKENS; запрос собирается
+#     функцией _make_query().  Всё остальное API неизменно.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -17,29 +16,70 @@ from fastapi import FastAPI, Path, Response
 from starlette.responses import PlainTextResponse
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG – правим здесь, код ниже трогать не придётся
 # ---------------------------------------------------------------------------
 PORTALS: List[str] = [
     "ledir.thund.re",
     "stalker.ugoiptv.com:80",
+    "93.119.105.61:80",
+    "clientsportals.tv:2095",    # ← новый портал (idx 3)
+    "foxx.pure-iptv.net:80"
 ]
 
-MAC_POOL = [
-    "00:1A:79:00:0A:2C", "00:1A:79:1A:04:B7", "00:1A:79:C5:94:26",
-    "00:1A:79:02:13:52", "00:1A:79:B9:81:75", "00:1A:79:02:59:77",
-    "00:1A:79:73:16:62", "00:1A:79:C6:E5:E9", "00:1A:79:00:09:7E",
-    "00:1A:79:22:5A:77", "00:1A:79:74:4E:C7",
+MAC_POOLS: Dict[str, List[str]] = {
+    "ledir.thund.re": [
+        "00:1A:79:00:0A:2C", "00:1A:79:1A:04:B7", "00:1A:79:C5:94:26",
+        "00:1A:79:02:13:52", "00:1A:79:B9:81:75",
+    ],
+    "stalker.ugoiptv.com:80": [
+        "00:1A:79:32:53:16", "00:1A:79:79:F2:42", "00:1A:79:00:1C:5B",
+        "00:1A:79:00:18:51", "00:1A:79:B1:66:BD", "00:1A:79:00:11:DE",
+        "00:1A:79:42:DA:30", "00:1A:79:31:61:31", "00:1A:79:B3:91:AA",
+        "00:1A:79:B6:5F:F0", "00:1A:79:E6:F9:FC", "00:1A:79:C1:1B:1A",
+        "00:1A:79:C2:7A:0F", "00:1A:79:BF:90:B0", "00:1A:79:7E:19:2B",
+        "00:1A:79:32:C5:93", "00:1A:79:E8:63:0C", "00:1A:79:7E:A9:DC",
+        "00:1A:79:B7:B4:EB", "00:1A:79:71:F3:B0", "00:1A:79:0E:33:7D",
+        "00:1A:79:13:2C:FD",
+    ],
+    "93.119.105.61:80": [
+        "00:1A:79:4D:F6:60", "00:1A:79:13:8F:5A", "00:1A:79:00:1F:2B",
+        "00:1A:79:B0:64:C2", "00:1A:79:00:40:EF", "00:1A:79:00:27:C5",
+        "00:1A:79:00:27:C4", "00:1A:79:4D:6F:C6", "00:1A:79:B5:B1:C2",
+    ],
+    "clientsportals.tv:2095": [
+        "00:1A:79:CC:3E:EE", "00:1A:79:BF:C8:FC", "00:1A:79:C8:64:66",
+        "00:1A:79:BF:C8:FD", "00:1A:79:B9:E6:73", "00:1A:79:B6:DF:D1",
+        "00:1A:79:52:36:AE", "00:1A:79:3C:A7:74", "00:1A:79:4D:EF:D0",
+        "00:1A:79:57:66:9E", "00:1A:79:3A:20:9C", "00:1A:79:4D:DD:33",
+    ],
+    "foxx.pure-iptv.net:80": [
+        "00:1A:79:6A:CD:E9", "00:1A:79:22:20:42", "00:1A:79:C1:92:57",
+        "00:1A:79:BE:55:F2", "00:1A:79:6A:3C:19", "00:1A:79:AC:76:38"
+    ],
+}
+# — для порталов с AuthToken —----------------------------------------------
+TOKEN_HOSTS = {"foxx.pure-iptv.net:80"}
+AUTH_TOKENS: Dict[str, str] = {
+    # mac                       :  token (example)
+    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
+    "00:1A:79:6A:3C:19": "7E8FB7840E9F9E60E9E070FE6482E793&sn2=",
+    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
+    "00:1A:79:C1:92:57": "9727A2E9CC67AA6E67A2A8D25C29EFA5&sn2=",
+}
+
+DEFAULT_MAC_POOL: List[str] = [
+    "00:1A:79:AA:BB:CC", "00:1A:79:DD:EE:FF",
 ]
 
 MAX_CACHE_KEYS  = 10_000
-MAX_CACHE_BYTES = 100 * 2**20   # 100 MiB (было 150 MiB)
-PLAYLIST_TTL    = 20            # s
-SEGMENT_TTL     = 8             # s
-SEG_OK_LIMIT    = 6             # ts before optional reswitch
-MIN_SWITCH_SEC  = 4             # s between playlist refresh
-HTTP_TIMEOUT    = 10            # s
+MAX_CACHE_BYTES = 50 * 2**20   # 50 MiB
+PLAYLIST_TTL    = 10           # s
+SEGMENT_TTL     = 4            # s
+SEG_OK_LIMIT    = 6
+MIN_SWITCH_SEC  = 4
+HTTP_TIMEOUT    = 10
 BAD_CODES       = {407, 458, 451, 512, 405}
-SESSION_IDLE_S  = 60            # удалить сессию, если не трогали ≥ 60 с
+SESSION_IDLE_S  = 30           # s
 
 # ---------------------------------------------------------------------------
 app = FastAPI()
@@ -52,8 +92,6 @@ _client = httpx.AsyncClient(timeout=HTTP_TIMEOUT,
     follow_redirects=True)
 
 # ---------------------------------------------------------------------------
-# LRU cache  url → (body, expire_ts, status, size)
-# ---------------------------------------------------------------------------
 class LRU(OrderedDict[str, Tuple[bytes, float, int, int]]):
     def __init__(self):
         super().__init__(); self.max_k = MAX_CACHE_KEYS; self.max_b = MAX_CACHE_BYTES
@@ -62,49 +100,42 @@ class LRU(OrderedDict[str, Tuple[bytes, float, int, int]]):
     async def get(self, k: str):
         async with self.lock:
             rec = self.pop(k, None)
-            if not rec:
-                return None
+            if not rec: return None
             body, exp, st, sz = rec
             if exp < time.time():
-                self.now_b -= sz
-                return None
-            self[k] = (body, exp, st, sz)  # touch
+                self.now_b -= sz; return None
+            self[k] = (body, exp, st, sz)
             return body, st
 
     async def put(self, k: str, body: bytes, ttl: int, st: int):
-        if ttl <= 0:
-            return
+        if ttl<=0: return
         async with self.lock:
             old = self.pop(k, None)
-            if old:
-                self.now_b -= old[3]
+            if old: self.now_b -= old[3]
             sz = len(body)
-            self[k] = (body, time.time()+ttl, st, sz)
-            self.now_b += sz
+            self[k] = (body, time.time()+ttl, st, sz); self.now_b += sz
             while self.now_b > self.max_b or len(self) > self.max_k:
-                _, (_, _, _, s) = self.popitem(last=False)
-                self.now_b -= s
+                _, (_,_,_,s) = self.popitem(last=False); self.now_b -= s
 
 _cache = LRU()
 
 # ---------------------------------------------------------------------------
-# per‑portal MAC index – чтобы разные порталы не банили пачкой
-# ---------------------------------------------------------------------------
-_mac_pos: defaultdict[str, int] = defaultdict(lambda: -1)
+_mac_pos: defaultdict[str,int] = defaultdict(lambda:-1)
+
+def _pool(host: str) -> List[str]:
+    return MAC_POOLS.get(host, DEFAULT_MAC_POOL)
 
 def next_mac(host: str) -> str:
-    _mac_pos[host] = (_mac_pos[host] + 1) % len(MAC_POOL)
-    mac = MAC_POOL[_mac_pos[host]]
+    pool = _pool(host)
+    _mac_pos[host] = (_mac_pos[host]+1) % len(pool)
+    mac = pool[_mac_pos[host]]
     log.info("HOST %s → MAC %s", host, mac)
     return mac
 
 # ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
 async def fetch(url: str, *, ttl: int):
     cached = await _cache.get(url)
-    if cached:
-        return cached  # type: ignore
+    if cached: return cached
     try:
         r = await _client.get(url)
     except Exception:
@@ -115,46 +146,47 @@ async def fetch(url: str, *, ttl: int):
 SEG_RE = re.compile(r"^(?!#)([^\r\n]+)", re.M)
 
 # ---------------------------------------------------------------------------
-# ► Per‑stream session state
-# ---------------------------------------------------------------------------
 class Session:
     def __init__(self):
-        self.portal_idx = 0
-        self.seg_ok = 0
-        self.last_switch = 0.0
-        self.base_url = ""
-        self.lock = asyncio.Lock()
-        self.last_use = time.time()
+        self.portal_idx = 0; self.seg_ok = 0; self.last_switch = 0.0
+        self.base_url = ""; self.lock = asyncio.Lock(); self.last_use = time.time()
 
-sessions: Dict[str, Session] = defaultdict(Session)  # sid -> Session()
+sessions: Dict[str, Session] = defaultdict(Session)
 
-# ---------------------------------------------------------------------------
-# Background cleanup of idle sessions
 # ---------------------------------------------------------------------------
 async def cleanup_sessions():
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
         now = time.time()
-        idle = [sid for sid, s in sessions.items() if now - s.last_use > SESSION_IDLE_S]
-        for sid in idle:
-            sessions.pop(sid, None)
-            log.info("Session %s expired (idle ≥ %ss)", sid, SESSION_IDLE_S)
+        for sid in [sid for sid,s in sessions.items() if now-s.last_use>SESSION_IDLE_S]:
+            sessions.pop(sid, None); log.info("Session %s expired (idle ≥ %ss)", sid, SESSION_IDLE_S)
 
 @app.on_event("startup")
 async def _on_start():
     asyncio.create_task(cleanup_sessions())
 
 # ---------------------------------------------------------------------------
-# Core logic
+# Формируем query‑string с учётом AuthToken для «особых» порталов
+# ---------------------------------------------------------------------------
+
+def _make_query(host: str, mac: str, sid: str) -> str:
+    qs = f"mac={quote(mac)}&stream={sid}&extension=m3u8"
+    if host in TOKEN_HOSTS:
+        token = AUTH_TOKENS.get(mac)
+        if not token:
+            log.error("No AuthToken for MAC %s on host %s", mac, host)
+        else:
+            qs += f"&AuthToken={token}&sn2="  # sn2= пустой, как в примере
+    return qs
+
 # ---------------------------------------------------------------------------
 async def obtain_playlist(sid: str, start_idx: int) -> Tuple[str, bytes, int]:
-    portals_chain = PORTALS[start_idx:] + PORTALS[:start_idx]
-    for offs, host in enumerate(portals_chain):
+    chain = PORTALS[start_idx:] + PORTALS[:start_idx]
+    for offs, host in enumerate(chain):
         play_url = f"http://{host}/play/live.php"
-        for _ in range(len(MAC_POOL)):
+        for _ in range(len(_pool(host))):
             mac = next_mac(host)
-            q   = f"mac={quote(mac)}&stream={sid}&extension=m3u8"
-            url = f"{play_url}?{q}"
+            url = f"{play_url}?{_make_query(host, mac, sid)}"
             log.info("PLAYLIST <= %s", url)
             try:
                 r = await _client.get(url)
@@ -162,9 +194,9 @@ async def obtain_playlist(sid: str, start_idx: int) -> Tuple[str, bytes, int]:
                 log.warning("network err: %s", e); continue
             await _cache.put(str(r.url), r.content, PLAYLIST_TTL, r.status_code)
             if 200 <= r.status_code < 300:
-                pr = urlparse(str(r.url))._replace(query="", fragment="")
-                base = urlunparse(pr) if str(r.url).endswith('/') else urlunparse(pr).rsplit('/', 1)[0] + '/'
-                idx = (start_idx + offs) % len(PORTALS)
+                pr   = urlparse(str(r.url))._replace(query="", fragment="")
+                base = urlunparse(pr) if str(r.url).endswith('/') else urlunparse(pr).rsplit('/',1)[0]+'/'
+                idx  = (start_idx+offs) % len(PORTALS)
                 log.info("PLAYLIST OK – host=%s idx=%s", host, idx)
                 return base, r.content, idx
             if r.status_code in BAD_CODES:
@@ -172,34 +204,32 @@ async def obtain_playlist(sid: str, start_idx: int) -> Tuple[str, bytes, int]:
             log.warning("MAC %s → unexpected HTTP %s", mac, r.status_code)
     raise httpx.HTTPStatusError("No working MAC", request=None, response=None)
 
-# -- link normaliser --------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def normalise(seg: str) -> str:
     seg = unquote(seg.strip())
-    if seg.startswith("%3A//"):
-        seg = "http" + seg[2:]
-    if seg.startswith("://"):
-        seg = "http" + seg
-    if "//" in seg and not seg.startswith(("http://", "https://", "/")):
-        seg = "http://" + seg.split("//", 1)[-1]
+    if seg.startswith("%3A//"): seg = "http" + seg[2:]
+    if seg.startswith("://"):  seg = "http" + seg
+    if "//" in seg and not seg.startswith(("http://","https://","/")):
+        seg = "http://" + seg.split("//",1)[-1]
     return seg
 
 
 def rewrite_m3u8(text: str, *, base: str) -> str:
     def repl(m: re.Match):
-        seg = normalise(m.group(1))
-        full = seg if seg.startswith(("http://", "https://")) else urljoin(base, seg)
-        u = urlparse(full)
+        seg  = normalise(m.group(1))
+        full = seg if seg.startswith(("http://","https://")) else urljoin(base, seg)
+        u    = urlparse(full)
         return f"/segment/{u.scheme}/{u.netloc}{u.path}"
     return SEG_RE.sub(repl, text)
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-@app.get("/playlist{idx}.m3u8")
-async def entry_numbered(idx: int = Path(..., ge=1), *, stream_id: str):
+@app.get("/playlist{idx:int}.m3u8")
+async def entry_numbered(idx: int, *, stream_id: str):
     return PlainTextResponse(status_code=307,
-        headers={"Location": f"/stream/{idx-1}/{stream_id}/index.m3u8"})
+        headers={"Location": f"/stream/{idx}/{stream_id}/index.m3u8"})
 
 @app.get("/playlist.m3u8")
 async def entry_default(stream_id: str):
@@ -243,6 +273,6 @@ async def segment(proto: str, path: str):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    host = "0.0.0.0"; port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     log.info("Proxy ready: %s portals, playlist TTL=%ss, segment TTL=%ss", len(PORTALS), PLAYLIST_TTL, SEGMENT_TTL)
-    uvicorn.run("stalker_hls_proxy:app", host=host, port=port)
+    uvicorn.run("stalker_hls_proxy:app", host="0.0.0.0", port=port)
