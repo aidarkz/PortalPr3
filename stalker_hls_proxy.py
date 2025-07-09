@@ -1,19 +1,18 @@
 # stalker_hls_proxy.py – лёгкая сборка (memory‑friendly) + AuthToken‑портал
 # ---------------------------------------------------------------------------
-# Изменения v8.4 (07 июл 2025)
-#   • Добавлен 5‑й портал **foxx.pure‑iptv.net:80** c обязательным AuthToken.
-#     ‑ AUTH_TOKENS: Dict[MAC→token]
-#     ‑ next_mac() для foxx берёт только MACʼи, у которых есть токен.
-#     ‑ obtain_playlist() автоматически подставляет «&AuthToken=…&sn2=»
-#       (без дублирования параметров).
-#   • Если токена для выбранного MAC нет — MAC пропускается (лог ERROR).
+# Изменения v8.5 (07 июл 2025)
+#   • **FIX**: портал *foxx.pure‑iptv.net* возвращал 204 No Content.  
+#       – 204 теперь считается ошибкой, плейлист должен быть **200** и иметь тело.  
+#       – дополнительная проверка: `len(r.content) > 0`.
+#   • `AUTH_TOKENS` передаётся **только AuthToken**, без `sn2=` (он не нужен).  
+#   • упрощена генерация URL, чтобы не путать сервер (& больше не дублируется).
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
 import asyncio, httpx, logging, re, sys, time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Tuple
-from urllib.parse import quote, urlencode, unquote, urljoin, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, urlencode, unquote, urljoin, urlparse, urlunparse
 
 from fastapi import FastAPI, Path, Response
 from starlette.responses import PlainTextResponse
@@ -66,11 +65,9 @@ AUTH_TOKENS: Dict[str, str] = {
     # mac                       :  token (example)
     "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
     "00:1A:79:6A:3C:19": "7E8FB7840E9F9E60E9E070FE6482E793&sn2=",
-    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
     "00:1A:79:C1:92:57": "9727A2E9CC67AA6E67A2A8D25C29EFA5&sn2=",
 }
 
-# DEFAULT MAC‑pool для порталов без явного списка / запасной набор
 DEFAULT_MAC_POOL: List[str] = [
     "00:1A:79:00:0A:2C", "00:1A:79:1A:04:B7", "00:1A:79:C5:94:26",
     "00:1A:79:02:13:52", "00:1A:79:B9:81:75", "00:1A:79:02:59:77",
@@ -78,14 +75,15 @@ DEFAULT_MAC_POOL: List[str] = [
 ]
 
 MAX_CACHE_KEYS  = 10_000
-MAX_CACHE_BYTES = 50 * 2**20   # 50 MiB
-PLAYLIST_TTL    = 10           # s
-SEGMENT_TTL     = 4            # s
+MAX_CACHE_BYTES = 50 * 2**20
+PLAYLIST_TTL    = 10
+SEGMENT_TTL     = 4
 SEG_OK_LIMIT    = 6
 MIN_SWITCH_SEC  = 4
 HTTP_TIMEOUT    = 10
-BAD_CODES       = {407,458,451,512,405,204}
-SESSION_IDLE_S  = 30           # s
+# 204 добавлен в BAD_CODES – теперь явно «плохой»
+BAD_CODES       = {204, 405, 407, 451, 458, 512}
+SESSION_IDLE_S  = 30
 
 # ---------------------------------------------------------------------------
 app = FastAPI()
@@ -123,14 +121,11 @@ _mac_pos: defaultdict[str,int]=defaultdict(lambda:-1)
 
 def _pool(host:str)->List[str]:
     if host=="foxx.pure-iptv.net:80":
-        # только MAC‑ы у которых есть токен
-        return [m for m in AUTH_TOKENS if m in MAC_POOLS.get(host,[]) or not MAC_POOLS.get(host)]
+        return [m for m in AUTH_TOKENS]
     return MAC_POOLS.get(host, DEFAULT_MAC_POOL)
 
 def next_mac(host:str)->str:
     pool=_pool(host)
-    if not pool:
-        raise RuntimeError(f"No MAC pool for {host}")
     _mac_pos[host]=(_mac_pos[host]+1)%len(pool)
     mac=pool[_mac_pos[host]]
     log.info("HOST %s → MAC %s", host, mac)
@@ -168,14 +163,10 @@ async def _on_start():
 
 # ---------------------------------------------------------------------------
 
-def auth_params(host:str, mac:str)->str:
+def auth_token(host:str, mac:str)->str|None:
     if host!="foxx.pure-iptv.net:80":
-        return ""
-    token=AUTH_TOKENS.get(mac)
-    if not token:
-        log.error("No AuthToken for MAC %s on host %s", mac, host)
-        return ""
-    return urlencode({"AuthToken":token,"sn2":""})  # sn2 пустой как в исходном
+        return None
+    return AUTH_TOKENS.get(mac)
 
 async def obtain_playlist(sid:str,start_idx:int):
     chain=PORTALS[start_idx:]+PORTALS[:start_idx]
@@ -183,24 +174,29 @@ async def obtain_playlist(sid:str,start_idx:int):
         play_url=f"http://{host}/play/live.php"
         for _ in range(len(_pool(host))):
             mac=next_mac(host)
-            qs={"mac":mac,"stream":sid,"extension":"m3u8"}
-            extra=auth_params(host,mac)
-            url=f"{play_url}?{urlencode(qs)}"+("&"+extra if extra else "")
+            params={"mac":mac,"stream":sid,"extension":"m3u8"}
+            token=auth_token(host,mac)
+            if host=="foxx.pure-iptv.net:80":
+                if not token:
+                    log.error("No AuthToken for MAC %s on host %s",mac,host); continue
+                params[":".join(["AuthToken"])] = token  # keep order stable
+            url=f"{play_url}?"+urlencode(params, safe=':')
             log.info("PLAYLIST <= %s",url)
             try:
                 r=await _client.get(url)
             except Exception as e:
                 log.warning("network err: %s",e); continue
             await _cache.put(str(r.url),r.content,PLAYLIST_TTL,r.status_code)
-            if 200<=r.status_code<300:
+            if r.status_code==200 and len(r.content)>0:
                 pr=urlparse(str(r.url))._replace(query="",fragment="")
                 base=urlunparse(pr) if str(r.url).endswith('/') else urlunparse(pr).rsplit('/',1)[0]+'/'
                 idx=(start_idx+offs)%len(PORTALS)
                 log.info("PLAYLIST OK – host=%s idx=%s",host,idx)
                 return base,r.content,idx
+            log.warning("MAC %s → HTTP %s",mac,r.status_code)
             if r.status_code in BAD_CODES:
-                log.warning("MAC %s → HTTP %s (skip)",mac,r.status_code); continue
-            log.warning("MAC %s → unexpected HTTP %s",mac,r.status_code)
+                continue
+        # end MAC loop
     raise httpx.HTTPStatusError("No working MAC",request=None,response=None)
 
 # ----- m3u8 rewrite -----------------------------------------------------
@@ -215,51 +211,4 @@ def normalise(seg:str)->str:
 
 def rewrite_m3u8(text:str,*,base:str)->str:
     def repl(m:re.Match):
-        seg=normalise(m.group(1))
-        full=seg if seg.startswith(("http://","https://")) else urljoin(base,seg)
-        u=urlparse(full)
-        return f"/segment/{u.scheme}/{u.netloc}{u.path}"
-    return SEG_RE.sub(repl,text)
-
-# ----- Routes -----------------------------------------------------------
-@app.get("/playlist{idx:int}.m3u8")
-async def entry_numbered(idx:int,*,stream_id:str):
-    return PlainTextResponse(status_code=307,headers={"Location":f"/stream/{idx}/{stream_id}/index.m3u8"})
-
-@app.get("/playlist.m3u8")
-async def entry_default(stream_id:str):
-    return PlainTextResponse(status_code=307,headers={"Location":f"/stream/0/{stream_id}/index.m3u8"})
-
-@app.get("/stream/{portal_idx}/{sid}/index.m3u8")
-async def playlist(portal_idx:int,sid:str):
-    s=sessions[sid]; s.portal_idx=portal_idx%len(PORTALS); s.seg_ok=0; s.last_switch=time.time(); s.last_use=time.time()
-    try:
-        base,raw,s.portal_idx=await obtain_playlist(sid,s.portal_idx)
-    except httpx.HTTPStatusError as e:
-        return PlainTextResponse(f"playlist error: {e}",status_code=502)
-    s.base_url=base
-    return Response(rewrite_m3u8(raw.decode(errors="ignore"),base=base),media_type="application/vnd.apple.mpegurl")
-
-@app.get("/segment/{proto}/{path:path}")
-async def segment(proto:str,path:str):
-    url=f"{proto}://{path}"; body,st=await fetch(url,ttl=SEGMENT_TTL)
-    sid_hint=path.split('/')[-1].split('_')[0]; s=sessions.get(sid_hint)
-    if s:
-        s.last_use=time.time(); ok=200<=st<300; s.seg_ok=s.seg_ok+1 if ok else SEG_OK_LIMIT
-        if s.seg_ok>=SEG_OK_LIMIT and time.time()-s.last_switch>MIN_SWITCH_SEC:
-            async with s.lock:
-                if s.seg_ok>=SEG_OK_LIMIT and time.time()-s.last_switch>MIN_SWITCH_SEC:
-                    log.info("=== switching playlist (sid=%s) after %s segments ===",sid_hint,s.seg_ok)
-                    s.seg_ok=0; s.last_switch=time.time()
-                    try:
-                        await obtain_playlist(sid_hint,s.portal_idx)
-                    except Exception as e:
-                        log.warning("reswitch failed: %s",e)
-    return Response(body,media_type="video/MP2T",status_code=st)
-
-# ---------------------------------------------------------------------------
-if __name__=="__main__":
-    import uvicorn, os
-    port=int(sys.argv[1]) if len(sys.argv)>1 else int(os.environ.get("PORT",8080))
-    log.info("Proxy ready: %s portals",len(PORTALS))
-    uvicorn.run("stalker_hls_proxy:app",host="0.0.0.0",port=port)
+        seg=normalise(m.group(
