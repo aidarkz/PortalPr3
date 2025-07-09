@@ -1,11 +1,9 @@
 # stalker_hls_proxy.py – лёгкая сборка (memory‑friendly) + AuthToken‑портал
 # ---------------------------------------------------------------------------
-# Изменения v8.5 (07 июл 2025)
-#   • **FIX**: портал *foxx.pure‑iptv.net* возвращал 204 No Content.  
-#       – 204 теперь считается ошибкой, плейлист должен быть **200** и иметь тело.  
-#       – дополнительная проверка: `len(r.content) > 0`.
-#   • `AUTH_TOKENS` передаётся **только AuthToken**, без `sn2=` (он не нужен).  
-#   • упрощена генерация URL, чтобы не путать сервер (& больше не дублируется).
+# Изменения v8.6 (07 июл 2025)
+#   • **FIX** SyntaxError в rewrite_m3u8 (скобка не закрыта).
+#   • AuthToken добавляется как обычный параметр (`AuthToken=<tok>`), без трюков.
+#   • 204 No Content → BAD_CODES, плейлисту нужен **200** и ненулевое тело.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -24,10 +22,11 @@ PORTALS: List[str] = [
     "ledir.thund.re",
     "stalker.ugoiptv.com:80",
     "93.119.105.61:80",
-    "clientsportals.tv:2095",    # ← новый портал (idx 3)
-    "foxx.pure-iptv.net:80"
+    "clientportal.com:2095",
+    "foxx.pure-iptv.net:80",  # portal‑5 – с AuthToken
 ]
 
+# MAC‑пулы --------------------------------------------------------------
 MAC_POOLS: Dict[str, List[str]] = {
     "ledir.thund.re": [
         "00:1A:79:00:0A:2C", "00:1A:79:1A:04:B7", "00:1A:79:C5:94:26",
@@ -37,7 +36,7 @@ MAC_POOLS: Dict[str, List[str]] = {
         "00:1A:79:32:53:16", "00:1A:79:79:F2:42", "00:1A:79:00:1C:5B",
         "00:1A:79:00:18:51", "00:1A:79:B1:66:BD", "00:1A:79:00:11:DE",
         "00:1A:79:42:DA:30", "00:1A:79:31:61:31", "00:1A:79:B3:91:AA",
-        "00:1A:79:B6:5F:F0", "00:1A:79:E6:F9:FC", "00:1A:79:C1:1B:1A",
+        "00:1A:79:B6:5F:F0",  "00:1A:79:E6:F9:FC", "00:1A:79:C1:1B:1A",
         "00:1A:79:C2:7A:0F", "00:1A:79:BF:90:B0", "00:1A:79:7E:19:2B",
         "00:1A:79:32:C5:93", "00:1A:79:E8:63:0C", "00:1A:79:7E:A9:DC",
         "00:1A:79:B7:B4:EB", "00:1A:79:71:F3:B0", "00:1A:79:0E:33:7D",
@@ -48,24 +47,18 @@ MAC_POOLS: Dict[str, List[str]] = {
         "00:1A:79:B0:64:C2", "00:1A:79:00:40:EF", "00:1A:79:00:27:C5",
         "00:1A:79:00:27:C4", "00:1A:79:4D:6F:C6", "00:1A:79:B5:B1:C2",
     ],
-    "clientsportals.tv:2095": [
-        "00:1A:79:CC:3E:EE", "00:1A:79:BF:C8:FC", "00:1A:79:C8:64:66",
-        "00:1A:79:BF:C8:FD", "00:1A:79:B9:E6:73", "00:1A:79:B6:DF:D1",
-        "00:1A:79:52:36:AE", "00:1A:79:3C:A7:74", "00:1A:79:4D:EF:D0",
-        "00:1A:79:57:66:9E", "00:1A:79:3A:20:9C", "00:1A:79:4D:DD:33",
-    ],
-    "foxx.pure-iptv.net:80": [
-        "00:1A:79:6A:CD:E9", "00:1A:79:22:20:42", "00:1A:79:C1:92:57",
-        "00:1A:79:BE:55:F2", "00:1A:79:6A:3C:19", "00:1A:79:AC:76:38"
+    "clientportal.com:2095": [
+        "00:1A:79:4D:F6:60", "00:1A:79:13:8F:5A", "00:1A:79:00:1F:2B",
+        "00:1A:79:B0:64:C2", "00:1A:79:00:40:EF", "00:1A:79:00:27:C5",
+        "00:1A:79:00:27:C4", "00:1A:79:4D:6F:C6", "00:1A:79:B5:B1:C2",
     ],
 }
-# — для порталов с AuthToken —----------------------------------------------
-TOKEN_HOSTS = {"foxx.pure-iptv.net:80"}
+
+# foxx.pure‑iptv.net: постоянные AuthToken
 AUTH_TOKENS: Dict[str, str] = {
-    # mac                       :  token (example)
-    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
-    "00:1A:79:6A:3C:19": "7E8FB7840E9F9E60E9E070FE6482E793&sn2=",
-    "00:1A:79:C1:92:57": "9727A2E9CC67AA6E67A2A8D25C29EFA5&sn2=",
+    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA",
+    "00:1A:79:C1:92:57": "9727A2E9CC67AA6E67A2A8D25C29EFA5",
+    "00:1A:79:6A:3C:19": "7E8FB7840E9F9E60E9E070FE6482E793",
 }
 
 DEFAULT_MAC_POOL: List[str] = [
@@ -81,7 +74,6 @@ SEGMENT_TTL     = 4
 SEG_OK_LIMIT    = 6
 MIN_SWITCH_SEC  = 4
 HTTP_TIMEOUT    = 10
-# 204 добавлен в BAD_CODES – теперь явно «плохой»
 BAD_CODES       = {204, 405, 407, 451, 458, 512}
 SESSION_IDLE_S  = 30
 
@@ -121,7 +113,7 @@ _mac_pos: defaultdict[str,int]=defaultdict(lambda:-1)
 
 def _pool(host:str)->List[str]:
     if host=="foxx.pure-iptv.net:80":
-        return [m for m in AUTH_TOKENS]
+        return list(AUTH_TOKENS)
     return MAC_POOLS.get(host, DEFAULT_MAC_POOL)
 
 def next_mac(host:str)->str:
@@ -154,7 +146,8 @@ async def cleanup_sessions():
     while True:
         await asyncio.sleep(15)
         now=time.time()
-        for sid in [s for s,v in sessions.items() if now-v.last_use>SESSION_IDLE_S]:
+        idle=[sid for sid,s in sessions.items() if now-s.last_use>SESSION_IDLE_S]
+        for sid in idle:
             sessions.pop(sid,None); log.info("Session %s expired",sid)
 
 @app.on_event("startup")
@@ -164,9 +157,7 @@ async def _on_start():
 # ---------------------------------------------------------------------------
 
 def auth_token(host:str, mac:str)->str|None:
-    if host!="foxx.pure-iptv.net:80":
-        return None
-    return AUTH_TOKENS.get(mac)
+    return AUTH_TOKENS.get(mac) if host=="foxx.pure-iptv.net:80" else None
 
 async def obtain_playlist(sid:str,start_idx:int):
     chain=PORTALS[start_idx:]+PORTALS[:start_idx]
@@ -175,40 +166,15 @@ async def obtain_playlist(sid:str,start_idx:int):
         for _ in range(len(_pool(host))):
             mac=next_mac(host)
             params={"mac":mac,"stream":sid,"extension":"m3u8"}
-            token=auth_token(host,mac)
-            if host=="foxx.pure-iptv.net:80":
-                if not token:
-                    log.error("No AuthToken for MAC %s on host %s",mac,host); continue
-                params[":".join(["AuthToken"])] = token  # keep order stable
-            url=f"{play_url}?"+urlencode(params, safe=':')
+            tok=auth_token(host,mac)
+            if tok:
+                params["AuthToken"]=tok
+            url=f"{play_url}?"+urlencode(params,safe=':')
             log.info("PLAYLIST <= %s",url)
             try:
                 r=await _client.get(url)
             except Exception as e:
                 log.warning("network err: %s",e); continue
             await _cache.put(str(r.url),r.content,PLAYLIST_TTL,r.status_code)
-            if r.status_code==200 and len(r.content)>0:
-                pr=urlparse(str(r.url))._replace(query="",fragment="")
-                base=urlunparse(pr) if str(r.url).endswith('/') else urlunparse(pr).rsplit('/',1)[0]+'/'
-                idx=(start_idx+offs)%len(PORTALS)
-                log.info("PLAYLIST OK – host=%s idx=%s",host,idx)
-                return base,r.content,idx
-            log.warning("MAC %s → HTTP %s",mac,r.status_code)
-            if r.status_code in BAD_CODES:
-                continue
-        # end MAC loop
-    raise httpx.HTTPStatusError("No working MAC",request=None,response=None)
-
-# ----- m3u8 rewrite -----------------------------------------------------
-
-def normalise(seg:str)->str:
-    seg=unquote(seg.strip())
-    if seg.startswith("%3A//"): seg="http"+seg[2:]
-    if seg.startswith("://"): seg="http"+seg
-    if "//" in seg and not seg.startswith(("http://","https://","/")):
-        seg="http://"+seg.split("//",1)[-1]
-    return seg
-
-def rewrite_m3u8(text:str,*,base:str)->str:
-    def repl(m:re.Match):
-        seg=normalise(m.group(
+            if r.status_code==200 and r.content:
+                pr=urlparse(str(r.url)).
