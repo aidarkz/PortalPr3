@@ -177,4 +177,4 @@ async def obtain_playlist(sid:str,start_idx:int):
                 log.warning("network err: %s",e); continue
             await _cache.put(str(r.url),r.content,PLAYLIST_TTL,r.status_code)
             if r.status_code==200 and r.content:
-                pr=urlparse(str(r.url)).
+                pr=urlparse(str(r.url))
