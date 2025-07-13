@@ -24,8 +24,7 @@ PORTALS: List[str] = [
     "stalker.ugoiptv.com:80",
     "93.119.105.61:80",
     "clientsportals.tv:2095",    # ← новый портал (idx 3)
-    "foxx.pure-iptv.net:80"
-    "mag.dmtn.tv:8080"
+    "foxx.pure-iptv.net:80",
 ]
 
 MAC_POOLS: Dict[str, List[str]] = {
@@ -36,19 +35,25 @@ MAC_POOLS: Dict[str, List[str]] = {
         "00:1A:79:7B:1D:45", "00:1A:79:6E:82:2C",
     ],
     "stalker.ugoiptv.com:80": [
+        "00:1A:79:B7:B4:EB", "00:1A:79:71:F3:B0", "00:1A:79:76:2D:D2",
+        "00:1A:79:C2:7A:0F", "00:1A:79:BF:90:B0", "00:1A:79:6F:1F:CB",
+        "00:1A:79:97:BA:47", "00:1A:79:BE:BF:B5", "00:1A:79:FF:FF:F4",
         "00:1A:79:32:53:16", "00:1A:79:79:F2:42", "00:1A:79:00:1C:5B",
         "00:1A:79:00:18:51", "00:1A:79:B1:66:BD", "00:1A:79:00:11:DE",
         "00:1A:79:42:DA:30", "00:1A:79:31:61:31", "00:1A:79:B3:91:AA",
         "00:1A:79:B6:5F:F0", "00:1A:79:E6:F9:FC", "00:1A:79:C1:1B:1A",
         "00:1A:79:C2:7A:0F", "00:1A:79:BF:90:B0", "00:1A:79:7E:19:2B",
         "00:1A:79:32:C5:93", "00:1A:79:E8:63:0C", "00:1A:79:7E:A9:DC",
-        "00:1A:79:B7:B4:EB", "00:1A:79:71:F3:B0", "00:1A:79:0E:33:7D",
-        "00:1A:79:13:2C:FD",
+        "00:1A:79:13:2C:FD", 
     ],
     "93.119.105.61:80": [
         "00:1A:79:4D:F6:60", "00:1A:79:13:8F:5A", "00:1A:79:00:1F:2B",
         "00:1A:79:B0:64:C2", "00:1A:79:00:40:EF", "00:1A:79:00:27:C5",
+        "00:1A:79:82:05:98", "00:1A:79:72:BB:CF", "00:1A:79:79:4C:E4",
         "00:1A:79:00:27:C4", "00:1A:79:4D:6F:C6", "00:1A:79:B5:B1:C2",
+        "00:1A:79:C2:7E:5F", "00:1A:79:B5:B6:D5", "00:1A:79:80:5F:4C",
+        "00:1A:79:01:B6:C5", "00:1A:79:B0:64:C2", "00:1A:79:00:28:B5",
+        "00:1A:79:65:ED:E2", "00:1A:79:B5:B1:C2",     
     ],
     "clientsportals.tv:2095": [
         "00:1A:79:CC:3E:EE", "00:1A:79:BF:C8:FC", "00:1A:79:C8:64:66",
@@ -57,22 +62,20 @@ MAC_POOLS: Dict[str, List[str]] = {
         "00:1A:79:57:66:9E", "00:1A:79:3A:20:9C", "00:1A:79:4D:DD:33",
     ],
     "foxx.pure-iptv.net:80": [
-        "00:1A:79:6A:CD:E9", "00:1A:79:22:20:42", "00:1A:79:C1:92:57",
+        "00:1A:79:AF:01:C7", "00:1A:79:22:20:42", "00:1A:79:C1:92:57",
         "00:1A:79:BE:55:F2", "00:1A:79:6A:3C:19", "00:1A:79:AC:76:38"
-    ],
-        "mag.dmtn.tv:8080": [
-        "00:1A:79:76:38:7E", 
     ],
 }
 
 # foxx.pure‑iptv.net: постоянные AuthToken‑ы (по MAC)
+TOKEN_HOSTS = {"foxx.pure-iptv.net:80"}
+
 AUTH_TOKENS: Dict[str, str] = {
+    "00:1A:79:AF:01:C7": "AC38FF7569DB3E0D41A548EDC5367D23&sn2=",
     "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
-    "00:1A:79:6A:3C:19": "7E8FB7840E9F9E60E9E070FE6482E793&sn2=",
-    "00:1A:79:AC:76:38": "99E271197A32250B0F8DCAA0E9E3A4EA&sn2=",
+    "00:1A:79:6A:3C:19": "FCB9D1D3070185FAD9DD9A707ADC160B&sn2=",
     "00:1A:79:C1:92:57": "9727A2E9CC67AA6E67A2A8D25C29EFA5&sn2=",
     "00:1A:79:BE:55:F2": "6BC5B0C9FEA2C54A71704A6D5E528668&sn2=",
-    "00:1A:79:6A:3C:19": "FCB9D1D3070185FAD9DD9A707ADC160B&sn2=",
 }
 
 DEFAULT_MAC_POOL: List[str] = [
@@ -102,7 +105,7 @@ _client = httpx.AsyncClient(timeout=HTTP_TIMEOUT,
     follow_redirects=True)
 
 # ---------------------------------------------------------------------------
-class LRU(OrderedDict[str, Tuple[bytes, float, int, int]]):
+class LRU(OrderedDict):
     def __init__(self):
         super().__init__(); self.max_k=MAX_CACHE_KEYS; self.max_b=MAX_CACHE_BYTES
         self.now_b=0; self.lock=asyncio.Lock()
@@ -171,8 +174,8 @@ async def _on_start():
 
 # ---------------------------------------------------------------------------
 
-def auth_token(host:str, mac:str)->str|None:
-    return AUTH_TOKENS.get(mac) if host=="foxx.pure-iptv.net:80" else None
+def auth_token(host:str, mac:str) -> str | None:
+    return AUTH_TOKENS.get(mac) if host in TOKEN_HOSTS else None
 
 async def obtain_playlist(sid:str,start_idx:int):
     chain=PORTALS[start_idx:]+PORTALS[:start_idx]
